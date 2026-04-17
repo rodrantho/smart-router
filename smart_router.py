@@ -61,6 +61,71 @@ def est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+# ── Tool-call format converters ──────────────────────────────────────────────
+
+def tc_ollama_to_openai(tool_calls: list) -> list:
+    """Convert Ollama tool_call list → OpenAI format expected by clients."""
+    result = []
+    for i, tc in enumerate(tool_calls or []):
+        func = tc.get("function") or {}
+        args = func.get("arguments", {})
+        # Ollama returns arguments as a dict; OpenAI wants a JSON string
+        if isinstance(args, dict):
+            args = json.dumps(args, ensure_ascii=False)
+        result.append({
+            "id": tc.get("id") or f"call_{i:06x}",
+            "type": "function",
+            "function": {
+                "name": func.get("name", ""),
+                "arguments": args,
+            },
+        })
+    return result
+
+
+def tc_openai_to_ollama(tool_calls: list) -> list:
+    """Convert OpenAI tool_call list → Ollama format for forwarding."""
+    result = []
+    for tc in tool_calls or []:
+        func = (tc.get("function") or {}).copy()
+        args = func.get("arguments", {})
+        # OpenAI arguments is a JSON string; Ollama wants a dict
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {"_raw": args}
+        func["arguments"] = args
+        result.append({"function": func})
+    return result
+
+
+def normalize_messages_for_ollama(messages: list) -> list:
+    """
+    Flatten message list for Ollama:
+    - content: list-of-blocks → plain string
+    - assistant tool_calls: OpenAI format → Ollama format
+    - role=tool messages: drop tool_call_id (Ollama doesn't use it)
+    - preserve content=None as "" (Ollama needs a string)
+    """
+    norm = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        nm = {k: v for k, v in m.items()}          # shallow copy
+        nm["content"] = msg_text(m) or ""           # always string
+        # convert assistant tool_calls to Ollama format
+        if nm.get("tool_calls"):
+            nm["tool_calls"] = tc_openai_to_ollama(nm["tool_calls"])
+        # Ollama doesn't use tool_call_id on role=tool messages
+        nm.pop("tool_call_id", None)
+        # Ollama doesn't understand name field on tool messages
+        if nm.get("role") == "tool":
+            nm.pop("name", None)
+        norm.append(nm)
+    return norm
+
+
 def msg_text(msg) -> str:
     """Extrae el texto de un mensaje OpenAI. `content` puede ser str o lista
     de bloques (formato multimodal / tools)."""
@@ -233,14 +298,8 @@ async def chat(request: Request):
             "answer": content[:300],
         })
 
-    # Ollama expects content as plain string; flatten OpenAI-style list blocks
-    norm_messages = []
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        nm = dict(m)
-        nm["content"] = msg_text(m)
-        norm_messages.append(nm)
+    # Normalize messages: flatten content + convert tool_call formats
+    norm_messages = normalize_messages_for_ollama(messages)
 
     # build the forward payload: pass through tools/options from the client
     forward = {"model": model, "messages": norm_messages}
@@ -276,12 +335,14 @@ async def chat(request: Request):
                                 chunk = json.loads(line)
                                 msg = chunk.get("message", {}) or {}
                                 token = msg.get("content", "") or ""
-                                tool_calls = msg.get("tool_calls")
+                                tool_calls_raw = msg.get("tool_calls")
+                                tool_calls = tc_ollama_to_openai(tool_calls_raw) if tool_calls_raw else None
                                 done = chunk.get("done", False)
                                 collected.append(token)
                                 delta = {"content": token}
                                 if tool_calls:
                                     delta["tool_calls"] = tool_calls
+                                    delta["content"] = None
                                 sse = {
                                     "id": "chatcmpl-router",
                                     "object": "chat.completion.chunk",
@@ -329,12 +390,14 @@ async def chat(request: Request):
             )
         msg = data.get("message", {}) or {}
         content = msg.get("content", "") or ""
-        tool_calls = msg.get("tool_calls")
+        tool_calls_raw = msg.get("tool_calls")
+        tool_calls = tc_ollama_to_openai(tool_calls_raw) if tool_calls_raw else None
         elapsed = time.time() - t_start
         record(content, elapsed)
-        assistant_msg = {"role": "assistant", "content": content}
+        assistant_msg = {"role": "assistant", "content": content if not tool_calls else None}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
+            print(f"  [Router] tool_calls in response: {[t['function']['name'] for t in tool_calls]}")
         return JSONResponse(
                 {
                     "id": "chatcmpl-router",
