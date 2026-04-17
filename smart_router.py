@@ -61,6 +61,25 @@ def est_tokens(text: str) -> int:
     return max(1, len(text) // 4)
 
 
+def msg_text(msg) -> str:
+    """Extrae el texto de un mensaje OpenAI. `content` puede ser str o lista
+    de bloques (formato multimodal / tools)."""
+    c = msg.get("content", "")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        parts = []
+        for block in c:
+            if isinstance(block, dict):
+                t = block.get("text") or block.get("content") or ""
+                if isinstance(t, str):
+                    parts.append(t)
+            elif isinstance(block, str):
+                parts.append(block)
+        return " ".join(parts)
+    return str(c) if c is not None else ""
+
+
 def calc_cost(level: str, tokens_in: int, tokens_out: int) -> float:
     """Cost this would have been on the cloud equivalent"""
     p = CLOUD_EQUIV.get(level)
@@ -143,7 +162,7 @@ async def chat(request: Request):
         level = requested
     elif "router" in requested or requested == "smart-router":
         last_user = next(
-            (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+            (msg_text(m) for m in reversed(messages) if m.get("role") == "user"), ""
         )
         level = await classify(last_user)
         model = MODELS[level]
@@ -151,12 +170,12 @@ async def chat(request: Request):
         model = requested
         level = "medio"
 
-    print(f"  [Router] level={level} -> model={model}")
+    print(f"  [Router] level={level} -> model={model} (msgs={len(messages)})")
 
     last_user_msg = next(
-        (m["content"] for m in reversed(messages) if m["role"] == "user"), ""
+        (msg_text(m) for m in reversed(messages) if m.get("role") == "user"), ""
     )
-    prompt_text = " ".join(m.get("content", "") for m in messages)
+    prompt_text = " ".join(msg_text(m) for m in messages)
     tokens_in = est_tokens(prompt_text)
 
     def record(content: str, elapsed: float):
@@ -180,64 +199,117 @@ async def chat(request: Request):
             "answer": content[:300],
         })
 
+    # Ollama expects content as plain string; flatten OpenAI-style list blocks
+    norm_messages = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        nm = dict(m)
+        nm["content"] = msg_text(m)
+        norm_messages.append(nm)
+
+    # build the forward payload: pass through tools/options from the client
+    forward = {"model": model, "messages": norm_messages}
+    for k in ("tools", "tool_choice", "format", "keep_alive", "options"):
+        if k in body:
+            forward[k] = body[k]
+    # map common OpenAI options into ollama options
+    opts = dict(forward.get("options") or {})
+    for src, dst in (("temperature", "temperature"), ("top_p", "top_p"),
+                     ("max_tokens", "num_predict"), ("seed", "seed"),
+                     ("stop", "stop"), ("frequency_penalty", "frequency_penalty"),
+                     ("presence_penalty", "presence_penalty")):
+        if src in body and dst not in opts:
+            opts[dst] = body[src]
+    if opts:
+        forward["options"] = opts
+
     if stream:
         collected = []
 
         async def stream_response():
-            async with httpx.AsyncClient(timeout=120) as client:
-                async with client.stream(
-                    "POST",
-                    f"{OLLAMA}/api/chat",
-                    json={"model": model, "messages": messages, "stream": True},
-                ) as resp:
-                    async for line in resp.aiter_lines():
-                        if not line:
-                            continue
-                        try:
-                            chunk = json.loads(line)
-                            token = chunk.get("message", {}).get("content", "")
-                            done = chunk.get("done", False)
-                            collected.append(token)
-                            sse = {
-                                "id": "chatcmpl-router",
-                                "object": "chat.completion.chunk",
-                                "model": model,
-                                "choices": [
-                                    {
-                                        "delta": {"content": token},
-                                        "finish_reason": "stop" if done else None,
-                                        "index": 0,
-                                    }
-                                ],
-                            }
-                            yield f"data: {json.dumps(sse)}\n\n"
-                            if done:
-                                elapsed = time.time() - t_start
-                                record("".join(collected), elapsed)
-                                yield "data: [DONE]\n\n"
-                        except Exception:
-                            continue
+            try:
+                async with httpx.AsyncClient(timeout=300) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{OLLAMA}/api/chat",
+                        json={**forward, "stream": True},
+                    ) as resp:
+                        async for line in resp.aiter_lines():
+                            if not line:
+                                continue
+                            try:
+                                chunk = json.loads(line)
+                                msg = chunk.get("message", {}) or {}
+                                token = msg.get("content", "") or ""
+                                tool_calls = msg.get("tool_calls")
+                                done = chunk.get("done", False)
+                                collected.append(token)
+                                delta = {"content": token}
+                                if tool_calls:
+                                    delta["tool_calls"] = tool_calls
+                                sse = {
+                                    "id": "chatcmpl-router",
+                                    "object": "chat.completion.chunk",
+                                    "model": model,
+                                    "choices": [
+                                        {
+                                            "delta": delta,
+                                            "finish_reason": ("tool_calls" if tool_calls else "stop") if done else None,
+                                            "index": 0,
+                                        }
+                                    ],
+                                }
+                                yield f"data: {json.dumps(sse)}\n\n"
+                                if done:
+                                    elapsed = time.time() - t_start
+                                    record("".join(collected), elapsed)
+                                    yield "data: [DONE]\n\n"
+                            except Exception as inner:
+                                print(f"  [Router] stream parse error: {inner}")
+                                continue
+            except Exception as e:
+                import traceback
+                print(f"  [Router] stream error: {type(e).__name__}: {e}")
+                traceback.print_exc()
+                err = {"error": {"message": str(e), "type": type(e).__name__}}
+                yield f"data: {json.dumps(err)}\n\n"
+                yield "data: [DONE]\n\n"
 
         return StreamingResponse(stream_response(), media_type="text/event-stream")
     else:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(
-                f"{OLLAMA}/api/chat",
-                json={"model": model, "messages": messages, "stream": False},
-            )
-            data = r.json()
-            content = data.get("message", {}).get("content", "")
-            elapsed = time.time() - t_start
-            record(content, elapsed)
+        try:
+            async with httpx.AsyncClient(timeout=300) as client:
+                r = await client.post(
+                    f"{OLLAMA}/api/chat",
+                    json={**forward, "stream": False},
+                )
+                data = r.json()
+        except Exception as e:
+            import traceback
+            print(f"  [Router] forward error: {type(e).__name__}: {e}")
+            traceback.print_exc()
             return JSONResponse(
+                {"error": {"message": str(e), "type": type(e).__name__}},
+                status_code=502,
+            )
+        msg = data.get("message", {}) or {}
+        content = msg.get("content", "") or ""
+        tool_calls = msg.get("tool_calls")
+        elapsed = time.time() - t_start
+        record(content, elapsed)
+        assistant_msg = {"role": "assistant", "content": content}
+        if tool_calls:
+            assistant_msg["tool_calls"] = tool_calls
+        return JSONResponse(
                 {
                     "id": "chatcmpl-router",
                     "object": "chat.completion",
                     "model": model,
                     "choices": [
                         {
-                            "message": {"role": "assistant", "content": content},
-                            "finish_reason": "stop",
+                            "message": assistant_msg,
+                            "finish_reason": "tool_calls" if tool_calls else "stop",
                             "index": 0,
                         }
                     ],
