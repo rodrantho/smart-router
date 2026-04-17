@@ -1,0 +1,7 @@
+# Ejemplo de Modelfile para ampliar contexto a 32k
+# Uso: ollama create llama3.1-32k -f Modelfile.example
+
+FROM llama3.1:8b
+
+PARAMETER num_ctx 32768
+PARAMETER temperature 0.7
