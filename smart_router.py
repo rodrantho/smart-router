@@ -88,14 +88,48 @@ def calc_cost(level: str, tokens_in: int, tokens_out: int) -> float:
     return (tokens_in / 1_000_000) * p["in"] + (tokens_out / 1_000_000) * p["out"]
 
 
+# Fast heuristic classification - avoids a classifier call when the answer is obvious
+CODE_MARKERS = ("```", "def ", "function ", "import ", "from ", "class ",
+                "const ", " let ", " var ", "npm ", "pip install", "SELECT ",
+                "SELECT\n", "error:", "traceback", "stacktrace", "stack trace",
+                "syntaxerror", "typeerror", "<script", "<html", "curl ", "git ",
+                "sudo ", "async ", "await ", "=>", " && ", " || ")
+
+REASONING_MARKERS = ("solve", "calcula", "calculate", "compute", "demuestra",
+                     "prove that", "step by step", "paso a paso", "why does",
+                     "por que ", "how many", "cuantos ", "cuantas ")
+
+
+def heuristic_classify(query: str) -> str | None:
+    """Return a level if the query is obviously in one category, else None."""
+    q = (query or "").strip()
+    if not q:
+        return "rapido"
+    ql = q.lower()
+    if len(q) < 40:
+        return "rapido"
+    if any(m in ql for m in CODE_MARKERS):
+        return "complejo"
+    if any(m in ql for m in REASONING_MARKERS):
+        return "razonamiento"
+    return None
+
+
 async def classify(query: str) -> str:
+    # Try heuristics first - saves ~1-2s per request
+    h = heuristic_classify(query)
+    if h:
+        print(f"  [Router] heuristic match: {h} (len={len(query)})")
+        return h
+    short = query[:150].replace("\n", " ")
+    print(f"  [Router] classifying (len={len(query)}): {short!r}")
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             r = await client.post(
                 f"{OLLAMA}/api/generate",
                 json={
                     "model": CLASSIFIER_MODEL,
-                    "prompt": CLASSIFY_PROMPT.format(query=query[:300]),
+                    "prompt": CLASSIFY_PROMPT.format(query=short),
                     "stream": False,
                     "options": {"temperature": 0, "num_predict": 5},
                 },
