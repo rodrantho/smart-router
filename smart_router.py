@@ -15,19 +15,19 @@ sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 OLLAMA = "http://localhost:11434"
 
 MODELS = {
-    "rapido":       "qwen2.5:1.5b",
-    "medio":        "gemma4:e2b",
-    "razonamiento": "phi4-mini-reasoning:latest",
-    "complejo":     "llama3.1:8b",
+    "rapido":       "qwen2.5:1.5b",              # ~1 GB   40 tok/s — chat simple
+    "medio":        "qwen2.5:3b",                 # ~1.9 GB 21 tok/s — conocimiento general
+    "razonamiento": "phi4-mini-reasoning:latest", # ~3.2 GB          — math, lógica
+    "complejo":     "gemma4:e2b",                 # ~3.1 GB          — código, tools, agentes
 }
 
 # Equivalent cloud pricing USD per 1M tokens (input / output)
 # These are the models you would have used in the cloud for the same task
 CLOUD_EQUIV = {
     "rapido":       {"name": "GPT-4o-mini",   "in": 0.15,  "out": 0.60},
-    "medio":        {"name": "GPT-4o-mini",   "in": 0.15,  "out": 0.60},
+    "medio":        {"name": "GPT-4o",        "in": 2.50,  "out": 10.00},
     "razonamiento": {"name": "o1-mini",       "in": 1.10,  "out": 4.40},
-    "complejo":     {"name": "Claude Sonnet", "in": 3.00,  "out": 15.00},
+    "complejo":     {"name": "GPT-4o",        "in": 2.50,  "out": 10.00},
 }
 
 CLASSIFIER_MODEL = "gemma3:1b"
@@ -256,6 +256,18 @@ async def chat(request: Request):
     requested = body.get("model", "smart-router")
     t_start = time.time()
 
+    # Debug log when tools are present or conversation has tool turns
+    has_tools = "tools" in body
+    has_tool_msgs = any(m.get("role") == "tool" for m in messages)
+    if has_tools or has_tool_msgs:
+        print(f"  [Router] TOOL REQUEST: msgs={len(messages)} has_tools={has_tools} has_tool_msgs={has_tool_msgs}")
+        for i, m in enumerate(messages[-4:]):   # last 4 msgs
+            role = m.get("role", "?")
+            content_preview = str(msg_text(m))[:80].replace('\n', ' ')
+            tc = m.get("tool_calls")
+            tc_names = [t.get("function", {}).get("name") for t in (tc or [])]
+            print(f"    msg[-{min(4,len(messages))-i}] role={role} tc={tc_names} content={content_preview!r}")
+
     if requested in MODELS:
         model = MODELS[requested]
         level = requested
@@ -391,13 +403,15 @@ async def chat(request: Request):
         msg = data.get("message", {}) or {}
         content = msg.get("content", "") or ""
         tool_calls_raw = msg.get("tool_calls")
+        if tool_calls_raw:
+            print(f"  [Router] RAW tool_calls from Ollama: {json.dumps(tool_calls_raw, ensure_ascii=False)[:400]}")
         tool_calls = tc_ollama_to_openai(tool_calls_raw) if tool_calls_raw else None
         elapsed = time.time() - t_start
         record(content, elapsed)
         assistant_msg = {"role": "assistant", "content": content if not tool_calls else None}
         if tool_calls:
             assistant_msg["tool_calls"] = tool_calls
-            print(f"  [Router] tool_calls in response: {[t['function']['name'] for t in tool_calls]}")
+            print(f"  [Router] tool_calls → OpenAI: {json.dumps(tool_calls, ensure_ascii=False)[:400]}")
         return JSONResponse(
                 {
                     "id": "chatcmpl-router",
